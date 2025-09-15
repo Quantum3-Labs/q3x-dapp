@@ -1,23 +1,27 @@
 mod ecdsa;
+mod privacy;
+mod vetkey;
 mod wallet;
 
+use crate::privacy::{
+    decrypt_wallet_data, encrypt_message_with_vetkeys, encrypt_principals_with_vetkeys,
+};
+use crate::vetkey::set_vetkey_id;
 use crate::wallet::{MultiSignatureWallet, TransferArgs, Wallet, WalletError};
-//use candid::Principal;
 use ic_cdk::api::management_canister::ecdsa::EcdsaKeyId;
-use ic_cdk::{caller, init, query, update};
+use ic_cdk::{init, query, update};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 
 use crate::ecdsa::{get_ecdsa_key_id_from_env, is_signature_valid, sign_message};
 
 use candid::Principal;
 
-//use ic_cdk::update;
 use ic_ledger_types::Tokens;
 
 type WalletStore = BTreeMap<String, Wallet>;
-type PrincipalWalletsMap = BTreeMap<Principal, Vec<String>>;
+type PrincipalWalletsMap = BTreeMap<Principal, HashSet<String>>; // use HashSet because we don't want duplicate wallet ids
 
 thread_local! {
     static PRINCIPAL_WALLETS_MAP: RefCell<PrincipalWalletsMap> = RefCell::default();
@@ -32,6 +36,7 @@ const WALLET_INVALID_SIGNATURE_ERROR: &str = "WalletInvalidSignature";
 const WALLET_CANNOT_SIGN_ERROR: &str = "WalletCannotSign";
 const WALLET_SIGNERS_NOT_MATCH_THRESHOLD: &str = "WalletSignersNotMatchThreshold";
 const METADATA_NOT_FOUND: &str = "MetadataNotFound";
+const ENCRYPTION_ERROR: &str = "EncryptionError";
 
 /// Initializes the module with environment-specific configurations.
 ///
@@ -42,6 +47,7 @@ const METADATA_NOT_FOUND: &str = "MetadataNotFound";
 /// # Behavior
 ///
 /// Initializes the KEY_ID with an EcdsaKeyId based on the provided environment.
+/// Initializes VetKD key ID for encryption/decryption operations based on the provided environment.
 #[init]
 fn init(env: String) {
     KEY_ID.with(|key_id| {
@@ -49,6 +55,9 @@ fn init(env: String) {
             .borrow_mut()
             .clone_from(&get_ecdsa_key_id_from_env(&env));
     });
+
+    // Initialize VetKD key for encryption/decryption
+    set_vetkey_id(&env);
 }
 
 /// Creates a new wallet.
@@ -63,14 +72,22 @@ fn init(env: String) {
 ///
 /// * `Result<(), String>` - Result indicating success or an error message.
 #[update]
-fn create_wallet(wallet_id: String, signers: Vec<Principal>, threshold: u8) -> Result<(), String> {
+async fn create_wallet(
+    wallet_id: String,
+    signers: Vec<Principal>,
+    threshold: u8,
+) -> Result<(), String> {
     if WALLETS.with(|wallets| wallets.borrow().contains_key(&wallet_id)) {
         return Err(WALLET_ALREADY_EXISTS_ERROR.to_string());
     }
 
+    let encrypted_signers = encrypt_principals_with_vetkeys(&signers, &wallet_id)
+        .await
+        .map_err(|e| format!("Failed to encrypt signers: {}", e))?;
+
     let mut wallet = Wallet::default();
-    signers.iter().for_each(|signer| {
-        wallet.add_signer(*signer);
+    encrypted_signers.iter().for_each(|signer| {
+        wallet.add_signer_principal_hex(signer.clone());
     });
 
     if wallet.set_default_threshold(threshold).is_err() {
@@ -83,11 +100,11 @@ fn create_wallet(wallet_id: String, signers: Vec<Principal>, threshold: u8) -> R
     });
 
     // Now, use the original wallet and wallet_id
-    for signer in wallet.get_signers() {
+    for signer in signers {
         let wallet_id_clone = wallet_id.clone(); // Clone wallet_id for use in the closure
         PRINCIPAL_WALLETS_MAP.with(|map| {
             let mut map = map.borrow_mut();
-            map.entry(signer).or_default().push(wallet_id_clone);
+            map.entry(signer).or_default().insert(wallet_id_clone);
         });
     }
     Ok(())
@@ -102,9 +119,33 @@ fn create_wallet(wallet_id: String, signers: Vec<Principal>, threshold: u8) -> R
 /// # Returns
 ///
 /// * `Option<Wallet>` - The wallet if found, otherwise None.
-#[query]
-fn get_wallet(wallet_id: String) -> Option<Wallet> {
-    WALLETS.with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+#[update]
+async fn get_wallet(wallet_id: String) -> Option<Wallet> {
+    let wallet = WALLETS.with(|wallets| wallets.borrow().get(&wallet_id).cloned());
+
+    if let Some(wallet) = wallet {
+        if wallet.has_signer(&wallet_id).await {
+            // Authorized - return decrypted wallet
+            match decrypt_wallet_data(
+                &wallet.get_signers(),
+                &wallet.get_default_threshold(),
+                &wallet.get_encrypted_messages_with_signers(),
+                &wallet.get_all_metadata(),
+                &wallet_id,
+            )
+            .await
+            {
+                Ok(decrypted_wallet) => Some(decrypted_wallet),
+                Err(_) => Some(wallet),
+            }
+        } else {
+            // Not authorized - return encrypted wallet
+            Some(wallet)
+        }
+    } else {
+        // Wallet not found
+        None
+    }
 }
 
 /// Proposes a message to be signed by the wallet.
@@ -118,22 +159,29 @@ fn get_wallet(wallet_id: String) -> Option<Wallet> {
 ///
 /// * `Result<(), String>` - Result indicating success or an error message.
 #[update]
-fn propose(wallet_id: String, msg: String) -> Result<(), String> {
+async fn propose(wallet_id: String, msg: String) -> Result<(), String> {
     debug_println_caller("propose");
     let msg = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
+
+    let mut wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    wallet
+        .propose_message(msg, &wallet_id)
+        .await
+        .map_err(|error| match error {
+            WalletError::InvalidSignature => WALLET_INVALID_SIGNATURE_ERROR.to_string(),
+            WalletError::MsgAlreadyQueued => WALLET_MSG_ALREADY_QUEUED_ERROR.to_string(),
+            WalletError::EncryptionError => ENCRYPTION_ERROR.to_string(),
+            _ => "UnknownError".to_string(),
+        })?;
+
     WALLETS.with(|wallets| {
-        wallets
-            .borrow_mut()
-            .get_mut(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
-            .unwrap()
-            .propose_message(caller(), msg)
-            .map_err(|error| match error {
-                WalletError::MsgAlreadyQueued => WALLET_MSG_ALREADY_QUEUED_ERROR.to_string(),
-                WalletError::InvalidSignature => WALLET_INVALID_SIGNATURE_ERROR.to_string(),
-                _ => "UnknownError".to_string(),
-            })
-    })
+        wallets.borrow_mut().insert(wallet_id, wallet);
+    });
+
+    Ok(())
 }
 
 /// Checks if a message can be signed by the wallet.
@@ -146,19 +194,22 @@ fn propose(wallet_id: String, msg: String) -> Result<(), String> {
 /// # Returns
 ///
 /// * `bool` - True if the message can be signed, otherwise false.
-#[query]
-fn can_sign(wallet_id: String, msg: String) -> bool {
-    match hex::decode(&msg) {
-        Ok(decoded_msg) => WALLETS.with(|wallets| {
-            wallets
-                .borrow()
-                .get(&wallet_id)
-                .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
-                .unwrap()
-                .can_sign(&decoded_msg)
-        }),
-        Err(_) => false,
-    }
+#[update]
+async fn can_sign(wallet_id: String, msg: String) -> bool {
+    let decode_msg = hex::decode(&msg).unwrap_or_default();
+    let encrypted_message = match encrypt_message_with_vetkeys(&decode_msg, &wallet_id).await {
+        Ok(msg) => msg,
+        Err(_) => return false,
+    };
+
+    WALLETS.with(|wallets| {
+        wallets
+            .borrow()
+            .get(&wallet_id)
+            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
+            .unwrap()
+            .can_sign(&encrypted_message)
+    })
 }
 
 /// Approves a message for signing in the wallet.
@@ -172,22 +223,29 @@ fn can_sign(wallet_id: String, msg: String) -> bool {
 ///
 /// * `Result<u8, String>` - The number of signatures or an error message.
 #[update]
-fn approve(wallet_id: String, msg: String) -> Result<u8, String> {
+async fn approve(wallet_id: String, msg: String) -> Result<u8, String> {
     debug_println_caller("approve");
     let msg = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
 
+    let mut wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let result = wallet
+        .approve(msg, &wallet_id)
+        .await
+        .map_err(|error| match error {
+            WalletError::MsgNotQueued => "WalletMsgNotQueued".to_string(),
+            WalletError::InvalidSignature => WALLET_INVALID_SIGNATURE_ERROR.to_string(),
+            WalletError::MsgAlreadySignedBySigner => "WalletMsgAlreadySignedBySigner".to_string(),
+            _ => "UnknownError".to_string(),
+        })?;
+
     WALLETS.with(|wallets| {
-        wallets
-            .borrow_mut()
-            .get_mut(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())?
-            .approve(msg, caller())
-            .map_err(|error| match error {
-                WalletError::MsgNotQueued => "WalletMsgNotQueued".to_string(),
-                WalletError::InvalidSignature => WALLET_INVALID_SIGNATURE_ERROR.to_string(),
-                _ => "UnknownError".to_string(),
-            })
-    })
+        wallets.borrow_mut().insert(wallet_id, wallet);
+    });
+
+    Ok(result)
 }
 
 /// Signs a message using the wallet.
@@ -202,7 +260,11 @@ fn approve(wallet_id: String, msg: String) -> Result<u8, String> {
 /// * `Result<String, String>` - The signature in hexadecimal format or an error message.
 #[update]
 async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
-    let msg = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
+    let msg: Vec<u8> = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
+
+    let encrypted_message = encrypt_message_with_vetkeys(&msg, &wallet_id)
+        .await
+        .map_err(|_| "EncryptionError".to_string())?;
 
     let can_sign = WALLETS.with(|wallets| {
         wallets
@@ -210,7 +272,7 @@ async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
             .get(&wallet_id)
             .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
             .unwrap()
-            .can_sign(&msg)
+            .can_sign(&encrypted_message)
     });
 
     let key_id = KEY_ID.with(|key_id| key_id.borrow().clone());
@@ -220,6 +282,9 @@ async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
     }
     let mut is_special_message = false;
     let mut pending_transfer: Option<(Wallet, TransferArgs)> = None;
+    let mut pending_add_signer: Option<Principal> = None;
+    let mut pending_remove_signer: Option<Principal> = None;
+
     if let Ok(message_str) = String::from_utf8(msg.clone()) {
         WALLETS.with(|wallets| {
             let mut wallets = wallets.borrow_mut();
@@ -234,23 +299,13 @@ async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
             if message_str.starts_with("ADD_SIGNER::") {
                 let new_signer_str = &message_str["ADD_SIGNER::".len()..];
                 if let Ok(new_signer) = Principal::from_str(new_signer_str) {
-                    wallet.add_signer(new_signer);
-                    PRINCIPAL_WALLETS_MAP.with(|map| {
-                        let mut map = map.borrow_mut();
-                        map.entry(new_signer).or_default().push(wallet_id.clone());
-                    });
+                    pending_add_signer = Some(new_signer);
                 }
                 is_special_message = true;
             } else if message_str.starts_with("REMOVE_SIGNER::") {
                 let signer_to_remove_str = &message_str["REMOVE_SIGNER::".len()..];
                 if let Ok(signer_to_remove) = Principal::from_str(signer_to_remove_str) {
-                    wallet.remove_signer(signer_to_remove);
-                    PRINCIPAL_WALLETS_MAP.with(|map| {
-                        let mut map = map.borrow_mut();
-                        if let Some(wallets) = map.get_mut(&signer_to_remove) {
-                            wallets.retain(|id| id != &wallet_id);
-                        }
-                    });
+                    pending_remove_signer = Some(signer_to_remove);
                 }
                 is_special_message = true;
             }
@@ -280,6 +335,39 @@ async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
             }
         });
     }
+
+    // handle for add and remove signer
+    if let Some(new_signer) = pending_add_signer {
+        if let Some(mut wallet) = WALLETS.with(|w| w.borrow().get(&wallet_id).cloned()) {
+            if wallet.add_signer(new_signer, &wallet_id).await.is_ok() {
+                WALLETS.with(|w| w.borrow_mut().insert(wallet_id.clone(), wallet));
+                PRINCIPAL_WALLETS_MAP.with(|map| {
+                    map.borrow_mut()
+                        .entry(new_signer)
+                        .or_default()
+                        .insert(wallet_id.clone());
+                });
+            }
+        }
+    }
+    if let Some(signer_to_remove) = pending_remove_signer {
+        if let Some(mut wallet) = WALLETS.with(|w| w.borrow().get(&wallet_id).cloned()) {
+            if wallet
+                .remove_signer(signer_to_remove, &wallet_id)
+                .await
+                .is_ok()
+            {
+                WALLETS.with(|w| w.borrow_mut().insert(wallet_id.clone(), wallet));
+                PRINCIPAL_WALLETS_MAP.with(|map| {
+                    if let Some(wallet_list) = map.borrow_mut().get_mut(&signer_to_remove) {
+                        wallet_list.retain(|id| id != &wallet_id);
+                    }
+                });
+            }
+        }
+    }
+
+    // handle for transfer
     if let Some((wallet_clone, args)) = pending_transfer {
         wallet_clone
             .transfer(args)
@@ -291,12 +379,16 @@ async fn sign(wallet_id: String, msg: String) -> Result<String, String> {
         false => hex::encode(sign_message(wallet_id.clone(), msg.clone(), key_id).await?),
     };
 
-    let _ = WALLETS.with(|wallets| {
-        wallets
-            .borrow_mut()
-            .get_mut(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())?
-            .remove_message_and_metadata(msg.clone(), caller())
+    let mut wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let _ = wallet
+        .remove_message_and_metadata(msg.clone(), &wallet_id)
+        .await;
+
+    WALLETS.with(|wallets| {
+        wallets.borrow_mut().insert(wallet_id, wallet);
     });
 
     Ok(signature)
@@ -334,21 +426,15 @@ async fn verify_signature(
 /// # Returns
 ///
 /// * `Vec<Vec<u8>>` - A list of messages that can be signed.
-#[query]
-fn get_messages_to_sign(wallet_id: String) -> Result<Vec<String>, String> {
-    WALLETS.with(|wallets| {
-        wallets
-            .borrow()
-            .get(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
-            .map(|wallet| {
-                wallet
-                    .get_messages_to_sign()
-                    .into_iter()
-                    .map(hex::encode)
-                    .collect()
-            })
-    })
+#[update]
+async fn get_messages_to_sign(wallet_id: String) -> Result<Vec<String>, String> {
+    let wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let messages = wallet.get_messages_to_sign(&wallet_id).await?;
+
+    Ok(messages.into_iter().map(hex::encode).collect())
 }
 
 /// Retrieves all messages that have been proposed for a given wallet.
@@ -360,21 +446,15 @@ fn get_messages_to_sign(wallet_id: String) -> Result<Vec<String>, String> {
 /// # Returns
 ///
 /// * `Vec<Vec<u8>>` - A list of messages that have been proposed.
-#[query]
-fn get_proposed_messages(wallet_id: String) -> Result<Vec<String>, String> {
-    WALLETS.with(|wallets| {
-        wallets
-            .borrow()
-            .get(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
-            .map(|wallet| {
-                wallet
-                    .get_proposed_messages()
-                    .into_iter()
-                    .map(hex::encode)
-                    .collect()
-            })
-    })
+#[update]
+async fn get_proposed_messages(wallet_id: String) -> Result<Vec<String>, String> {
+    let wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let messages = wallet.get_proposed_messages(&wallet_id).await?;
+
+    Ok(messages.into_iter().map(hex::encode).collect())
 }
 
 /// Retrieves all messages that have been proposed along with their signers for a given wallet.
@@ -385,22 +465,23 @@ fn get_proposed_messages(wallet_id: String) -> Result<Vec<String>, String> {
 ///
 /// # Returns
 ///
-/// * `Vec<(Vec<u8>, Vec<Principal>)>` - A list of tuples containing messages and their signers.
-#[query]
-fn get_messages_with_signers(wallet_id: String) -> Result<Vec<(String, Vec<Principal>)>, String> {
-    WALLETS.with(|wallets| {
-        wallets
-            .borrow()
-            .get(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())
-            .map(|wallet| {
-                wallet
-                    .get_messages_with_signers()
-                    .into_iter()
-                    .map(|(msg, signers)| (hex::encode(msg), signers))
-                    .collect()
-            })
-    })
+/// * `Vec<(Vec<u8>, Vec<String>)>` - A list of tuples containing messages and their signers (hex-string).
+#[update]
+async fn get_messages_with_signers(
+    wallet_id: String,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let messages_with_signers = wallet.get_messages_with_signers(&wallet_id).await?;
+
+    let result = messages_with_signers
+        .into_iter()
+        .map(|(msg, signers)| (hex::encode(msg), signers))
+        .collect();
+
+    Ok(result)
 }
 
 /// Proposes adding a new signer to the wallet.
@@ -414,10 +495,10 @@ fn get_messages_with_signers(wallet_id: String) -> Result<Vec<(String, Vec<Princ
 ///
 /// * `Result<(), String>` - Result indicating success or an error message.
 #[update]
-fn add_signer(wallet_id: String, new_signer: Principal) -> Result<String, String> {
+async fn add_signer(wallet_id: String, new_signer: Principal) -> Result<String, String> {
     debug_println_caller("add_signer");
     let special_message = hex::encode(format!("ADD_SIGNER::{new_signer}"));
-    let _ = propose(wallet_id, special_message.clone());
+    let _ = propose(wallet_id, special_message.clone()).await?;
     Ok(special_message)
 }
 
@@ -432,9 +513,10 @@ fn add_signer(wallet_id: String, new_signer: Principal) -> Result<String, String
 ///
 /// * `Result<(), String>` - Result indicating success or an error message.
 #[update]
-fn remove_signer(wallet_id: String, signer_to_remove: Principal) -> Result<String, String> {
+async fn remove_signer(wallet_id: String, signer_to_remove: Principal) -> Result<String, String> {
+    debug_println_caller("remove_signer");
     let special_message = hex::encode(format!("REMOVE_SIGNER::{signer_to_remove}"));
-    let _ = propose(wallet_id, special_message.clone());
+    let _ = propose(wallet_id, special_message.clone()).await?;
     Ok(special_message)
 }
 
@@ -449,16 +531,20 @@ fn remove_signer(wallet_id: String, signer_to_remove: Principal) -> Result<Strin
 ///
 /// * `Result<String, String>` - Result indicating success or an error message.
 #[update]
-fn set_threshold(wallet_id: String, new_threshold: u8) -> Result<String, String> {
+async fn set_threshold(wallet_id: String, new_threshold: u8) -> Result<String, String> {
     let special_message = hex::encode(format!("SET_THRESHOLD::{new_threshold}"));
-    let _ = propose(wallet_id, special_message.clone());
+    let _ = propose(wallet_id, special_message.clone()).await?;
     Ok(special_message)
 }
 
 #[update]
-fn transfer(wallet_id: String, amount: u64, to_principal: Principal) -> Result<String, String> {
+async fn transfer(
+    wallet_id: String,
+    amount: u64,
+    to_principal: Principal,
+) -> Result<String, String> {
     let special_message = hex::encode(format!("TRANSFER::{amount}::{to_principal}"));
-    let _ = propose(wallet_id, special_message.clone());
+    let _ = propose(wallet_id, special_message.clone()).await?;
     Ok(special_message)
 }
 
@@ -470,9 +556,9 @@ fn transfer(wallet_id: String, amount: u64, to_principal: Principal) -> Result<S
 ///
 /// # Returns
 ///
-/// * `Vec<String>` - A list of wallet IDs associated with the principal.
+/// * `HashSet<String>` - A list of wallet IDs associated with the principal.
 #[query]
-fn get_wallets_for_principal(principal: Principal) -> Vec<String> {
+fn get_wallets_for_principal(principal: Principal) -> HashSet<String> {
     PRINCIPAL_WALLETS_MAP.with(|map| map.borrow().get(&principal).cloned().unwrap_or_default())
 }
 
@@ -484,15 +570,20 @@ fn get_wallets_for_principal(principal: Principal) -> Vec<String> {
 ///
 /// Returns `Result<(), String>` indicating success or the type of failure.
 #[update]
-fn add_metadata(wallet_id: String, msg: String, metadata: String) -> Result<(), String> {
+async fn add_metadata(wallet_id: String, msg: String, metadata: String) -> Result<(), String> {
     let msg = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
+
+    let mut wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    wallet.add_metadata(msg, metadata, &wallet_id).await?;
+
     WALLETS.with(|wallets| {
-        wallets
-            .borrow_mut()
-            .get_mut(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())?
-            .add_metadata(msg, metadata, caller())
-    })
+        wallets.borrow_mut().insert(wallet_id, wallet);
+    });
+
+    Ok(())
 }
 
 /// Get the metadata associated with a message in the wallet.
@@ -500,18 +591,20 @@ fn add_metadata(wallet_id: String, msg: String, metadata: String) -> Result<(), 
 /// * `message` - The message as a `Vec<u8>`.
 ///
 /// Returns `Option<&String>` containing the metadata if it exists.
-#[query]
-fn get_metadata(wallet_id: String, msg: String) -> Result<String, String> {
+#[update]
+async fn get_metadata(wallet_id: String, msg: String) -> Result<String, String> {
     let msg = hex::decode(msg).map_err(|_| "InvalidMessage".to_string())?;
-    WALLETS.with(|wallets| {
-        wallets
-            .borrow()
-            .get(&wallet_id)
-            .ok_or(WALLET_NOT_FOUND_ERROR.to_string())?
-            .get_metadata(msg, caller())
-            .cloned()
-            .ok_or(METADATA_NOT_FOUND.to_string())
-    })
+
+    let wallet = WALLETS
+        .with(|wallets| wallets.borrow().get(&wallet_id).cloned())
+        .ok_or_else(|| WALLET_NOT_FOUND_ERROR.to_string())?;
+
+    let result = wallet
+        .get_metadata(msg, &wallet_id)
+        .await
+        .ok_or_else(|| METADATA_NOT_FOUND.to_string())?;
+
+    Ok(result.clone())
 }
 
 /// Proposes a message and adds metadata in one call.
@@ -526,9 +619,13 @@ fn get_metadata(wallet_id: String, msg: String) -> Result<String, String> {
 ///
 /// * `Result<(), String>` - Result indicating success or an error message.
 #[update]
-fn propose_with_metadata(wallet_id: String, msg: String, metadata: String) -> Result<(), String> {
-    propose(wallet_id.clone(), msg.clone())?;
-    add_metadata(wallet_id, msg, metadata)
+async fn propose_with_metadata(
+    wallet_id: String,
+    msg: String,
+    metadata: String,
+) -> Result<(), String> {
+    propose(wallet_id.clone(), msg.clone()).await?;
+    add_metadata(wallet_id, msg, metadata).await
 }
 
 fn debug_println_caller(method_name: &str) {

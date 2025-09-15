@@ -23,9 +23,9 @@ dfx start --clean
 
 ### Step 2: Determine ledger file locations
 
-The URL for the ledger Wasm module is `https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger.did`.
+The URL for the ledger Wasm module is `https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger-canister_notify-method.wasm.gz`.
 
-The URL for the ledger.did file is `https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger-canister_notify-method.wasm.gz`.
+The URL for the ledger.did file is `https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-07-04/ledger.did`.
 
 ## Step 3: Configure the `dfx.json` file to use the ledger
 

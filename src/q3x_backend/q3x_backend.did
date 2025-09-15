@@ -2,13 +2,13 @@ type Result = variant { Ok; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
 type Result_2 = variant { Ok : nat8; Err : text };
 type Result_3 = variant { Ok : vec text; Err : text };
-type Result_4 = variant { Ok : vec record { text; vec principal }; Err : text };
+type Result_4 = variant { Ok : vec record { text; vec text }; Err : text };
 type Result_5 = variant { Ok : bool; Err : text };
 type Wallet = record {
   threshold : nat8;
   metadata : vec record { blob; text };
-  signers : vec principal;
-  message_queue : vec record { blob; vec principal };
+  signers : vec text;
+  message_queue : vec record { blob; vec text };
 };
 service : (text) -> {
   // Add metadata to a message in the wallet.
@@ -51,7 +51,7 @@ service : (text) -> {
   // # Returns
   // 
   // * `bool` - True if the message can be signed, otherwise false.
-  can_sign : (text, text) -> (bool) query;
+  can_sign : (text, text) -> (bool);
   // Creates a new wallet.
   // 
   // # Arguments
@@ -73,7 +73,7 @@ service : (text) -> {
   // # Returns
   // 
   // * `Vec<Vec<u8>>` - A list of messages that can be signed.
-  get_messages_to_sign : (text) -> (Result_3) query;
+  get_messages_to_sign : (text) -> (Result_3);
   // Retrieves all messages that have been proposed along with their signers for a given wallet.
   // 
   // # Arguments
@@ -83,13 +83,13 @@ service : (text) -> {
   // # Returns
   // 
   // * `Vec<(Vec<u8>, Vec<Principal>)>` - A list of tuples containing messages and their signers.
-  get_messages_with_signers : (text) -> (Result_4) query;
+  get_messages_with_signers : (text) -> (Result_4);
   // Get the metadata associated with a message in the wallet.
   // 
   // * `message` - The message as a `Vec<u8>`.
   // 
   // Returns `Option<&String>` containing the metadata if it exists.
-  get_metadata : (text, text) -> (Result_1) query;
+  get_metadata : (text, text) -> (Result_1);
   // Retrieves all messages that have been proposed for a given wallet.
   // 
   // # Arguments
@@ -99,7 +99,7 @@ service : (text) -> {
   // # Returns
   // 
   // * `Vec<Vec<u8>>` - A list of messages that have been proposed.
-  get_proposed_messages : (text) -> (Result_3) query;
+  get_proposed_messages : (text) -> (Result_3);
   // Retrieves a wallet by its ID.
   // 
   // # Arguments
@@ -109,7 +109,7 @@ service : (text) -> {
   // # Returns
   // 
   // * `Option<Wallet>` - The wallet if found, otherwise None.
-  get_wallet : (text) -> (opt Wallet) query;
+  get_wallet : (text) -> (opt Wallet);
   // Retrieves all wallets associated with a given principal.
   // 
   // # Arguments
