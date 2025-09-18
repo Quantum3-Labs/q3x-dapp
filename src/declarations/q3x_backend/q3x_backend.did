@@ -1,38 +1,192 @@
+type Result = variant { Ok; Err : text };
+type Result_1 = variant { Ok : text; Err : text };
+type Result_2 = variant { Ok : nat8; Err : text };
+type Result_3 = variant { Ok : vec text; Err : text };
+type Result_4 = variant { Ok : vec record { text; vec text }; Err : text };
+type Result_5 = variant { Ok : bool; Err : text };
 type Wallet = record {
-    signers: vec principal;
-    threshold: nat8;
-    message_queue: vec record { vec nat8; vec principal; }
+  threshold : nat8;
+  metadata : vec record { blob; text };
+  signers : vec text;
+  message_queue : vec record { blob; vec text };
 };
-
-type Message = record {
-    message: text;
-    signers: vec principal;
-};
-
 service : (text) -> {
-    create_wallet: (text, vec principal, nat8) -> (variant { Ok; Err: text });
-    get_wallet: (text) ->  (opt Wallet);
-    can_sign: (text, text) -> (bool);
-    propose: (text, text) -> (variant { Ok; Err: text });
-    approve: (text, text) -> (variant { Ok: nat8; Err: text });
-    sign: (text, text) -> (variant { Ok: text; Err: text });
-    verify_signature: (text, text, text) -> (variant { Ok: bool; Err: text });
-    eth_address : (text) -> (variant { Ok: text ; Err: text });
-
-    get_messages_to_sign: (text) -> (variant { Ok: vec text; Err: text });
-    get_proposed_messages: (text) -> (variant { Ok: vec text; Err: text });
-    get_messages_with_signers: (text) -> (variant { Ok: vec record { text; vec principal };  Err: text });
-
-    add_signer: (text, principal) -> (variant { Ok: text; Err: text });
-    remove_signer: (text, principal) -> (variant { Ok: text; Err: text });
-    set_threshold: (text, nat8) -> (variant { Ok: text; Err: text });
-
-    get_wallets_for_principal: (principal) -> (vec text);
-
-    add_metadata: (text, text, text) -> (variant { Ok; Err: text });
-    get_metadata: (text, text) -> (variant { Ok: text; Err: text });
-
-    propose_with_metadata: (text, text, text) -> (variant { Ok; Err: text });
-
+  // Add metadata to a message in the wallet.
+  // 
+  // * `message` - The message as a `Vec<u8>`.
+  // * `metadata` - The metadata as a `String`.
+  // * `caller` - The `Principal` of the caller.
+  // 
+  // Returns `Result<(), String>` indicating success or the type of failure.
+  add_metadata : (text, text, text) -> (Result);
+  // Proposes adding a new signer to the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `new_signer` - The Principal of the new signer to add.
+  // 
+  // # Returns
+  // 
+  // * `Result<(), String>` - Result indicating success or an error message.
+  add_signer : (text, principal) -> (Result_1);
+  // Approves a message for signing in the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `msg` - The message to be approved, in hexadecimal format.
+  // 
+  // # Returns
+  // 
+  // * `Result<u8, String>` - The number of signatures or an error message.
+  approve : (text, text) -> (Result_2);
+  // Checks if a message can be signed by the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `msg` - The message to be checked, in hexadecimal format.
+  // 
+  // # Returns
+  // 
+  // * `bool` - True if the message can be signed, otherwise false.
+  can_sign : (text, text) -> (bool) query;
+  // Creates a new wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - Unique identifier for the wallet as a String.
+  // * `signers` - A list of Principals representing the signers of the wallet.
+  // * `threshold` - The threshold number of signers required for a transaction.
+  // 
+  // # Returns
+  // 
+  // * `Result<(), String>` - Result indicating success or an error message.
+  create_wallet : (text, vec principal, nat8) -> (Result);
+  // Retrieves all messages that can be signed for a given wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // 
+  // # Returns
+  // 
+  // * `Vec<Vec<u8>>` - A list of messages that can be signed.
+  get_messages_to_sign : (text) -> (Result_3);
+  // Retrieves all messages that have been proposed along with their signers for a given wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // 
+  // # Returns
+  // 
+  // * `Vec<(Vec<u8>, Vec<Principal>)>` - A list of tuples containing messages and their signers.
+  get_messages_with_signers : (text) -> (Result_4) query;
+  // Get the metadata associated with a message in the wallet.
+  // 
+  // * `message` - The message as a `Vec<u8>`.
+  // 
+  // Returns `Option<&String>` containing the metadata if it exists.
+  get_metadata : (text, text) -> (Result_1) query;
+  // Retrieves all messages that have been proposed for a given wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // 
+  // # Returns
+  // 
+  // * `Vec<Vec<u8>>` - A list of messages that have been proposed.
+  get_proposed_messages : (text) -> (Result_3) query;
+  // Retrieves a wallet by its ID.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The unique identifier for the wallet as a String.
+  // 
+  // # Returns
+  // 
+  // * `Option<Wallet>` - The wallet if found, otherwise None.
+  get_wallet : (text) -> (opt Wallet);
+  // Retrieves all wallets associated with a given principal.
+  // 
+  // # Arguments
+  // 
+  // * `principal` - The principal to retrieve wallets for.
+  // 
+  // # Returns
+  // 
+  // * `Vec<String>` - A list of wallet IDs associated with the principal.
+  get_wallets_for_principal : (principal) -> (vec text) query;
+  // Proposes a message to be signed by the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `msg` - The message to be proposed, in hexadecimal format.
+  // 
+  // # Returns
+  // 
+  // * `Result<(), String>` - Result indicating success or an error message.
+  propose : (text, text) -> (Result);
+  // Proposes a message and adds metadata in one call.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `msg` - The message to be proposed, in hexadecimal format.
+  // * `metadata` - The metadata to be added to the message.
+  // 
+  // # Returns
+  // 
+  // * `Result<(), String>` - Result indicating success or an error message.
+  propose_with_metadata : (text, text, text) -> (Result);
+  // Proposes removing a signer from the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `signer_to_remove` - The Principal of the signer to remove.
+  // 
+  // # Returns
+  // 
+  // * `Result<(), String>` - Result indicating success or an error message.
+  remove_signer : (text, principal) -> (Result_1);
+  // Proposes setting a new threshold for the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `new_threshold` - The new threshold value to set.
+  // 
+  // # Returns
+  // 
+  // * `Result<String, String>` - Result indicating success or an error message.
+  set_threshold : (text, nat8) -> (Result_1);
+  // Signs a message using the wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `msg` - The message to be signed, in hexadecimal format.
+  // 
+  // # Returns
+  // 
+  // * `Result<String, String>` - The signature in hexadecimal format or an error message.
+  sign : (text, text) -> (Result_1);
+  transfer : (text, nat64, principal) -> (Result_1);
+  // Verifies a signature for a given message and wallet.
+  // 
+  // # Arguments
+  // 
+  // * `wallet_id` - The wallet's unique identifier.
+  // * `message` - The message associated with the signature, in hexadecimal format.
+  // * `signature` - The signature to be verified, in hexadecimal format.
+  // 
+  // # Returns
+  // 
+  // * `Result<bool, String>` - True if the signature is valid, otherwise an error message.
+  verify_signature : (text, text, text) -> (Result_5);
 }
-

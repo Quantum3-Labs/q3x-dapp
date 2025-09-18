@@ -15,3 +15,5 @@ hex = { workspace = true }
 libsecp256k1 = { workspace = true }
 tiny-keccak = { workspace = true }
 ic-ledger-types = { workspace = true }
+ic-vetkeys = { workspace = true }
+getrandom = { workspace = true }

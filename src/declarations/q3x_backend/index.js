@@ -10,7 +10,7 @@ export { idlFactory } from "./q3x_backend.did.js";
  * beginning in dfx 0.15.0
  */
 export const canisterId =
-  process.env.CANISTER_ID_q3x_BACKEND;
+  process.env.CANISTER_ID_Q3X_BACKEND;
 
 export const createActor = (canisterId, options = {}) => {
   const agent = options.agent || new HttpAgent({ ...options.agentOptions });
